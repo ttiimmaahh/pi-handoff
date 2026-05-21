@@ -35,7 +35,11 @@ const CHEAP_HINTS = ["flash-lite", "flash", "haiku", "nano", "mini"];
 
 // Persisted, user-wide config written by /handoff-setup. Lives next to pi's
 // other agent state (auth.json, settings.json). Env vars always override it.
-type HandoffConfig = { model?: string; threshold?: number };
+type HandoffConfig = {
+	model?: string;
+	threshold?: number;
+	compaction?: "enrich" | "off";
+};
 
 function configPath(): string {
 	return (
@@ -65,6 +69,17 @@ function saveConfig(cfg: HandoffConfig): void {
 
 function isValidThreshold(n: number): boolean {
 	return Number.isFinite(n) && n > 0 && n < 100;
+}
+
+// Whether to replace pi's built-in compaction summary with our structured one.
+// Default on; env wins over saved config.
+function compactionEnrichEnabled(): boolean {
+	const env = process.env.PI_HANDOFF_COMPACTION?.trim().toLowerCase();
+	if (env === "off" || env === "0" || env === "false") return false;
+	if (env === "on" || env === "enrich" || env === "1" || env === "true") {
+		return true;
+	}
+	return getConfig().compaction !== "off";
 }
 
 // Precedence: env var → saved config → built-in default.
@@ -136,9 +151,7 @@ function modelLabel(m: Model<Api>, nameWidth: number): string {
 	return `${name.padEnd(nameWidth)}  ${cost}`;
 }
 
-const HANDOFF_PROMPT = `You are writing a HANDOFF DOCUMENT so a fresh AI coding session can resume this work with zero prior context. Read the conversation and produce structured markdown with exactly these sections:
-
-## Goal
+const HANDOFF_SECTIONS = `## Goal
 The user's overall objective, in one or two sentences.
 
 ## Current State
@@ -151,9 +164,41 @@ The immediate actions to take, in order. Be specific: file paths, commands, func
 Anything unresolved, risky, or waiting on the user.
 
 ## Key Facts & Conventions
-Durable facts needed to continue: commands, paths, gotchas, project conventions discovered during the session.
+Durable facts needed to continue: commands, paths, gotchas, project conventions discovered during the session.`;
 
-Be thorough but tight. Prefer concrete references (paths, symbols, commands) over prose. Do NOT invent anything the conversation does not support.`;
+const HANDOFF_GUIDANCE =
+	"Be thorough but tight. Prefer concrete references (paths, symbols, commands) over prose. Do NOT invent anything the conversation does not support.";
+
+// Full-session handoff for a fresh session (written to .pi/handoff.md).
+const HANDOFF_PROMPT = `You are writing a HANDOFF DOCUMENT so a fresh AI coding session can resume this work with zero prior context. Read the conversation and produce structured markdown with exactly these sections:
+
+${HANDOFF_SECTIONS}
+
+${HANDOFF_GUIDANCE}`;
+
+// Compaction summary for the earlier portion of an ongoing session (recent
+// turns are kept verbatim after this summary).
+const COMPACTION_PROMPT = `You are compacting an ongoing AI coding session. Summarize the EARLIER portion of the conversation below into structured markdown so the work continues seamlessly — recent turns are kept verbatim after your summary. Use exactly these sections:
+
+${HANDOFF_SECTIONS}
+
+${HANDOFF_GUIDANCE}`;
+
+// Pull the assistant's text out of a completion response, defensively (the
+// content is a union of block types).
+function joinAssistantText(content: readonly unknown[]): string {
+	return content
+		.filter(
+			(c): c is { type: "text"; text: string } =>
+				!!c &&
+				typeof c === "object" &&
+				(c as { type?: unknown }).type === "text" &&
+				typeof (c as { text?: unknown }).text === "string",
+		)
+		.map((c) => c.text)
+		.join("\n")
+		.trim();
+}
 
 async function generateHandoff(
 	ctx: ExtensionContext,
@@ -195,11 +240,7 @@ async function generateHandoff(
 		{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 8192, signal },
 	);
 
-	const summary = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n")
-		.trim();
+	const summary = joinAssistantText(response.content);
 	if (!summary) return undefined;
 
 	const usage = ctx.getContextUsage();
@@ -296,6 +337,74 @@ export default function (pi: ExtensionAPI) {
 				busy = false;
 			}
 		})();
+	});
+
+	// Phase 2 — replace pi's default compaction summary with our structured
+	// handoff format, so the in-context summary after /compact carries the same
+	// Goal/State/Next-Steps shape. Returns undefined (→ pi's default compaction)
+	// on opt-out or any failure.
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (!compactionEnrichEnabled()) return;
+
+		const model = pickSummaryModel(ctx);
+		if (!model) return;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok || !auth.apiKey) return;
+
+		const { preparation } = event;
+		const older = [
+			...preparation.messagesToSummarize,
+			...preparation.turnPrefixMessages,
+		];
+		const conversation = serializeConversation(convertToLlm(older));
+		if (!conversation.trim()) return;
+
+		const prior = preparation.previousSummary
+			? `\n\nEarlier summary, for continuity:\n${preparation.previousSummary}`
+			: "";
+
+		try {
+			const response = await complete(
+				model,
+				{
+					messages: [
+						{
+							role: "user" as const,
+							content: [
+								{
+									type: "text" as const,
+									text: `${COMPACTION_PROMPT}${prior}\n\n<conversation>\n${conversation}\n</conversation>`,
+								},
+							],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{
+					apiKey: auth.apiKey,
+					headers: auth.headers,
+					maxTokens: 8192,
+					signal: event.signal,
+				},
+			);
+			const summary = joinAssistantText(response.content);
+			if (!summary) return; // empty → fall back to pi's default compaction
+
+			ctx.ui.notify(
+				`[handoff] Structured compaction via ${model.id}.`,
+				"info",
+			);
+			return {
+				compaction: {
+					summary,
+					firstKeptEntryId: preparation.firstKeptEntryId,
+					tokensBefore: preparation.tokensBefore,
+				},
+			};
+		} catch {
+			// Any failure (incl. abort) → undefined → pi runs its default compaction.
+			return;
+		}
 	});
 
 	// Context shrinks after compaction — allow the next threshold crossing to regenerate.
@@ -445,10 +554,20 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			saveConfig({ ...cfg, model, threshold });
+			// Step 3 — structured compaction toggle.
+			const currentCompaction = cfg.compaction === "off" ? "off" : "on";
+			const enrich = await ctx.ui.confirm(
+				"Structured compaction?",
+				`Use the structured handoff format for pi's /compact summaries too, ` +
+					`replacing the default compaction summary? (currently: ${currentCompaction})`,
+			);
+			const compaction: "enrich" | "off" = enrich ? "enrich" : "off";
+
+			saveConfig({ ...cfg, model, threshold, compaction });
 			ctx.ui.notify(
 				`[handoff] Saved to ${configPath()} — model: ${model ?? "auto"}, ` +
-					`threshold: ${threshold ?? DEFAULT_THRESHOLD}%.`,
+					`threshold: ${threshold ?? DEFAULT_THRESHOLD}%, ` +
+					`compaction: ${compaction}.`,
 				"info",
 			);
 		},
