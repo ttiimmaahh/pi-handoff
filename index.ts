@@ -347,9 +347,18 @@ export default function (pi: ExtensionAPI) {
 		if (!compactionEnrichEnabled()) return;
 
 		const model = pickSummaryModel(ctx);
-		if (!model) return;
+		if (!model) {
+			ctx.ui.notify("[handoff] No model for compaction; using pi default.", "warning");
+			return;
+		}
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok || !auth.apiKey) return;
+		if (!auth.ok || !auth.apiKey) {
+			ctx.ui.notify(
+				`[handoff] No auth for ${model.id}; using pi default compaction.`,
+				"warning",
+			);
+			return;
+		}
 
 		const { preparation } = event;
 		const older = [
@@ -357,7 +366,15 @@ export default function (pi: ExtensionAPI) {
 			...preparation.turnPrefixMessages,
 		];
 		const conversation = serializeConversation(convertToLlm(older));
-		if (!conversation.trim()) return;
+		if (!conversation.trim()) {
+			ctx.ui.notify(
+				"[handoff] Nothing to summarize for compaction " +
+					`(toSummarize=${preparation.messagesToSummarize.length}, ` +
+					`turnPrefix=${preparation.turnPrefixMessages.length}); using pi default.`,
+				"warning",
+			);
+			return;
+		}
 
 		const prior = preparation.previousSummary
 			? `\n\nEarlier summary, for continuity:\n${preparation.previousSummary}`
@@ -388,7 +405,13 @@ export default function (pi: ExtensionAPI) {
 				},
 			);
 			const summary = joinAssistantText(response.content);
-			if (!summary) return; // empty → fall back to pi's default compaction
+			if (!summary) {
+				ctx.ui.notify(
+					"[handoff] Empty compaction summary; using pi default.",
+					"warning",
+				);
+				return; // fall back to pi's default compaction
+			}
 
 			ctx.ui.notify(
 				`[handoff] Structured compaction via ${model.id}.`,
@@ -401,8 +424,12 @@ export default function (pi: ExtensionAPI) {
 					tokensBefore: preparation.tokensBefore,
 				},
 			};
-		} catch {
-			// Any failure (incl. abort) → undefined → pi runs its default compaction.
+		} catch (err) {
+			// Don't break compaction — fall back to pi's default — but say so.
+			ctx.ui.notify(
+				`[handoff] Compaction enrichment failed (using pi default): ${(err as Error).message}`,
+				"warning",
+			);
 			return;
 		}
 	});
