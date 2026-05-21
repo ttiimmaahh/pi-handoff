@@ -14,8 +14,15 @@ import type {
 // The message type pi passes through the `context` hook. Derived from the
 // exported event type so we don't depend on @earendil-works/pi-agent-core directly.
 type AgentMessage = ContextEvent["messages"][number];
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +76,35 @@ function saveConfig(cfg: HandoffConfig): void {
 
 function isValidThreshold(n: number): boolean {
 	return Number.isFinite(n) && n > 0 && n < 100;
+}
+
+// Durable diagnostics: set PI_HANDOFF_DEBUG to a file path (or "1" for
+// <tmpdir>/pi-handoff-debug.jsonl) to append one JSON line per notable event.
+// Notifications are too transient to debug compaction; this isn't.
+function debugLog(entry: Record<string, unknown>): void {
+	const v = process.env.PI_HANDOFF_DEBUG?.trim();
+	if (!v) return;
+	const path =
+		v === "1" || v.toLowerCase() === "true"
+			? join(tmpdir(), "pi-handoff-debug.jsonl")
+			: v;
+	try {
+		appendFileSync(
+			path,
+			`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`,
+		);
+	} catch {
+		// never let logging break a real operation
+	}
+}
+
+function msgKind(m: unknown): string {
+	const o = m as { role?: unknown; type?: unknown };
+	return (
+		(typeof o?.role === "string" && o.role) ||
+		(typeof o?.type === "string" && o.type) ||
+		"?"
+	);
 }
 
 // Whether to replace pi's built-in compaction summary with our structured one.
@@ -344,15 +380,26 @@ export default function (pi: ExtensionAPI) {
 	// Goal/State/Next-Steps shape. Returns undefined (→ pi's default compaction)
 	// on opt-out or any failure.
 	pi.on("session_before_compact", async (event, ctx) => {
+		debugLog({
+			kind: "compaction-hook-fired",
+			enabled: compactionEnrichEnabled(),
+		});
 		if (!compactionEnrichEnabled()) return;
 
 		const model = pickSummaryModel(ctx);
 		if (!model) {
+			debugLog({ kind: "compaction-fallback", reason: "no-model" });
 			ctx.ui.notify("[handoff] No model for compaction; using pi default.", "warning");
 			return;
 		}
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok || !auth.apiKey) {
+			debugLog({
+				kind: "compaction-fallback",
+				reason: "no-auth",
+				model: model.id,
+				error: auth.ok ? "missing-apiKey" : auth.error,
+			});
 			ctx.ui.notify(
 				`[handoff] No auth for ${model.id}; using pi default compaction.`,
 				"warning",
@@ -366,7 +413,18 @@ export default function (pi: ExtensionAPI) {
 			...preparation.turnPrefixMessages,
 		];
 		const conversation = serializeConversation(convertToLlm(older));
+		debugLog({
+			kind: "compaction",
+			model: model.id,
+			toSummarize: preparation.messagesToSummarize.length,
+			turnPrefix: preparation.turnPrefixMessages.length,
+			olderKinds: older.map(msgKind),
+			conversationLen: conversation.length,
+			conversationPreview: conversation.slice(0, 400),
+			hasPreviousSummary: Boolean(preparation.previousSummary),
+		});
 		if (!conversation.trim()) {
+			debugLog({ kind: "compaction-fallback", reason: "empty-conversation" });
 			ctx.ui.notify(
 				"[handoff] Nothing to summarize for compaction " +
 					`(toSummarize=${preparation.messagesToSummarize.length}, ` +
@@ -405,6 +463,11 @@ export default function (pi: ExtensionAPI) {
 				},
 			);
 			const summary = joinAssistantText(response.content);
+			debugLog({
+				kind: "compaction-result",
+				summaryLen: summary.length,
+				summaryPreview: summary.slice(0, 200),
+			});
 			if (!summary) {
 				ctx.ui.notify(
 					"[handoff] Empty compaction summary; using pi default.",
@@ -413,6 +476,7 @@ export default function (pi: ExtensionAPI) {
 				return; // fall back to pi's default compaction
 			}
 
+			debugLog({ kind: "compaction-applied", model: model.id });
 			ctx.ui.notify(
 				`[handoff] Structured compaction via ${model.id}.`,
 				"info",
@@ -426,6 +490,11 @@ export default function (pi: ExtensionAPI) {
 			};
 		} catch (err) {
 			// Don't break compaction — fall back to pi's default — but say so.
+			debugLog({
+				kind: "compaction-fallback",
+				reason: "exception",
+				error: (err as Error).message,
+			});
 			ctx.ui.notify(
 				`[handoff] Compaction enrichment failed (using pi default): ${(err as Error).message}`,
 				"warning",
