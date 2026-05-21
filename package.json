@@ -1,0 +1,22 @@
+{
+  "name": "pi-handoff",
+  "version": "0.1.0",
+  "description": "Proactive context-handoff for the pi coding agent: at a context-usage threshold, auto-write a structured session handoff doc and offer to reload it in a new session.",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
