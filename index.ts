@@ -29,10 +29,11 @@ import { dirname, isAbsolute, join } from "node:path";
 // Config (env-overridable; sensible defaults so it works with zero setup)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_THRESHOLD = 80; // percent of the context window
+const DEFAULT_THRESHOLD_PCT = 80; // percent of the context window
 // Once over threshold we don't regenerate every single turn — only after the
 // usage climbs another REFRESH_STEP percent, so the doc stays fresh without
-// firing a summarization call on each turn.
+// firing a summarization call on each turn. We always debounce in percent,
+// regardless of which unit the threshold uses, so the cadence feels identical.
 const REFRESH_STEP = 5;
 const DEFAULT_REL_PATH = ".pi/handoff.md";
 // Only offer to reload a handoff this fresh on session start.
@@ -40,11 +41,19 @@ const STALE_MS = 24 * 60 * 60 * 1000;
 // Cheap/fast summarizer candidates, best first; matched by substring on model id.
 const CHEAP_HINTS = ["flash-lite", "flash", "haiku", "nano", "mini"];
 
+// Threshold can be a percent of the context window or an absolute token count.
+// Stored as a discriminated union; older configs (`threshold: 80`) are read as
+// percent for back-compat, see `readThreshold`.
+type Threshold =
+	| { type: "percent"; value: number }
+	| { type: "tokens"; value: number };
+
 // Persisted, user-wide config written by /handoff-setup. Lives next to pi's
 // other agent state (auth.json, settings.json). Env vars always override it.
 type HandoffConfig = {
 	model?: string;
-	threshold?: number;
+	// New shape: discriminated union. Legacy: bare number == percent.
+	threshold?: Threshold | number;
 	compaction?: "enrich" | "off";
 };
 
@@ -74,8 +83,80 @@ function saveConfig(cfg: HandoffConfig): void {
 	writeFileSync(p, `${JSON.stringify(cfg, null, 2)}\n`);
 }
 
-function isValidThreshold(n: number): boolean {
+function isValidPercent(n: number): boolean {
 	return Number.isFinite(n) && n > 0 && n < 100;
+}
+
+function isValidTokenCount(n: number): boolean {
+	// Sane lower bound to catch typos like "100" meant as 100k; upper bound
+	// generous enough for any realistic context window.
+	return Number.isFinite(n) && Number.isInteger(n) && n >= 1000 && n <= 10_000_000;
+}
+
+// Parse human-friendly token strings: "120000", "120k", "120K", "1.5m", "2M".
+// Returns undefined on garbage. Whole-number result; 1k = 1000, 1m = 1_000_000.
+function parseTokenCount(raw: string): number | undefined {
+	const s = raw.trim().toLowerCase();
+	if (!s) return undefined;
+	const m = /^(\d+(?:\.\d+)?)\s*([km])?$/.exec(s);
+	if (!m) return undefined;
+	const base = Number(m[1]);
+	if (!Number.isFinite(base)) return undefined;
+	const mult = m[2] === "k" ? 1000 : m[2] === "m" ? 1_000_000 : 1;
+	return Math.round(base * mult);
+}
+
+// Parse the env override / single-string form: "80" (legacy percent),
+// "80%", "120000", "120k", "1.5m". Returns undefined on garbage.
+function parseThresholdSpec(raw: string): Threshold | undefined {
+	const s = raw.trim();
+	if (!s) return undefined;
+	if (s.endsWith("%")) {
+		const n = Number(s.slice(0, -1).trim());
+		return isValidPercent(n) ? { type: "percent", value: n } : undefined;
+	}
+	// Bare integer in [1,99] is treated as percent for back-compat with the old
+	// PI_HANDOFF_THRESHOLD=80 spelling.
+	if (/^\d+$/.test(s)) {
+		const n = Number(s);
+		if (isValidPercent(n)) return { type: "percent", value: n };
+		if (isValidTokenCount(n)) return { type: "tokens", value: n };
+		return undefined;
+	}
+	const tokens = parseTokenCount(s);
+	return tokens != null && isValidTokenCount(tokens)
+		? { type: "tokens", value: tokens }
+		: undefined;
+}
+
+// Normalize a stored value into a Threshold, accepting the legacy bare-number
+// form. Returns undefined if the stored value is invalid.
+function normalizeStoredThreshold(
+	v: HandoffConfig["threshold"],
+): Threshold | undefined {
+	if (typeof v === "number") {
+		return isValidPercent(v) ? { type: "percent", value: v } : undefined;
+	}
+	if (v && typeof v === "object") {
+		if (v.type === "percent" && isValidPercent(v.value)) return v;
+		if (v.type === "tokens" && isValidTokenCount(v.value)) return v;
+	}
+	return undefined;
+}
+
+function formatThreshold(t: Threshold): string {
+	return t.type === "percent" ? `${t.value}%` : `${formatTokens(t.value)} tokens`;
+}
+
+// Compact token formatter for human-facing strings ("120k", "1.5M").
+function formatTokens(n: number): string {
+	if (n < 1000) return String(n);
+	if (n < 1_000_000) {
+		const k = n / 1000;
+		return `${k % 1 === 0 ? k.toFixed(0) : k.toFixed(1)}k`;
+	}
+	const m = n / 1_000_000;
+	return `${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}M`;
 }
 
 // Durable diagnostics: set PI_HANDOFF_DEBUG to a file path (or "1" for
@@ -118,13 +199,31 @@ function compactionEnrichEnabled(): boolean {
 	return getConfig().compaction !== "off";
 }
 
-// Precedence: env var → saved config → built-in default.
-function thresholdPct(): number {
-	const envV = Number(process.env.PI_HANDOFF_THRESHOLD);
-	if (isValidThreshold(envV)) return envV;
-	const cfgV = getConfig().threshold;
-	if (typeof cfgV === "number" && isValidThreshold(cfgV)) return cfgV;
-	return DEFAULT_THRESHOLD;
+// Precedence: env var → saved config → built-in default (80% of window).
+function effectiveThreshold(): Threshold {
+	const env = process.env.PI_HANDOFF_THRESHOLD;
+	if (env) {
+		const parsed = parseThresholdSpec(env);
+		if (parsed) return parsed;
+	}
+	const cfg = normalizeStoredThreshold(getConfig().threshold);
+	if (cfg) return cfg;
+	return { type: "percent", value: DEFAULT_THRESHOLD_PCT };
+}
+
+// Returns true when the current usage has crossed the configured threshold.
+// Uses the unit the user picked: percent compares against `usage.percent`,
+// tokens compares against `usage.tokens`. Either field can be null right after
+// compaction — in that case we report "not crossed" and wait for the next
+// turn's measurement.
+function isOverThreshold(
+	usage: { percent: number | null; tokens: number | null },
+	t: Threshold,
+): boolean {
+	if (t.type === "percent") {
+		return usage.percent != null && usage.percent >= t.value;
+	}
+	return usage.tokens != null && usage.tokens >= t.value;
 }
 
 function handoffPath(cwd: string): string {
@@ -135,6 +234,21 @@ function handoffPath(cwd: string): string {
 // Round percent for display; debounce math stays on the raw float.
 function fmtPct(n: number): string {
 	return `${Math.round(n)}%`;
+}
+
+// Human-friendly description of *current* usage relative to the chosen unit.
+// Used in notifications/handoff headers so the message matches the unit the
+// user configured ("context at 82%" vs "context at 142k tokens").
+function fmtUsage(
+	usage: { percent: number | null; tokens: number | null },
+	t: Threshold,
+): string {
+	if (t.type === "tokens" && usage.tokens != null) {
+		return `${formatTokens(usage.tokens)} tokens`;
+	}
+	if (usage.percent != null) return fmtPct(usage.percent);
+	if (usage.tokens != null) return `${formatTokens(usage.tokens)} tokens`;
+	return "unknown";
 }
 
 // Resolve a "provider/id" spec against the registry (split on the first "/";
@@ -280,6 +394,14 @@ async function generateHandoff(
 	if (!summary) return undefined;
 
 	const usage = ctx.getContextUsage();
+	const usageLine =
+		usage?.percent != null && usage?.tokens != null
+			? `- Context at generation: ${fmtPct(usage.percent)} (${formatTokens(usage.tokens)} tokens)`
+			: usage?.percent != null
+				? `- Context at generation: ${fmtPct(usage.percent)}`
+				: usage?.tokens != null
+					? `- Context at generation: ${formatTokens(usage.tokens)} tokens`
+					: "";
 	const header = [
 		"<!-- pi-handoff: auto-generated. Safe to edit or delete. -->",
 		"# Session Handoff",
@@ -289,7 +411,7 @@ async function generateHandoff(
 		`- Session: ${ctx.sessionManager.getSessionId()}`,
 		`- Conversation model: ${ctx.model?.id ?? "unknown"}`,
 		`- Summarizer: ${model.id}`,
-		usage?.percent != null ? `- Context at generation: ${fmtPct(usage.percent)}` : "",
+		usageLine,
 		"",
 		"---",
 		"",
@@ -345,19 +467,26 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Threshold watcher: fire-and-forget so we never block the turn. -------
 	pi.on("turn_end", (_event, ctx) => {
-		const pct = ctx.getContextUsage()?.percent;
-		if (pct == null || pct < thresholdPct()) return;
+		const usage = ctx.getContextUsage();
+		if (!usage) return;
+		const threshold = effectiveThreshold();
+		if (!isOverThreshold(usage, threshold)) return;
+		// Debounce always tracks percent (regardless of threshold unit) so the
+		// regeneration cadence feels identical in both modes.
+		const pct = usage.percent;
+		if (pct == null) return;
 		if (busy) return;
 		if (lastGenPct != null && pct < lastGenPct + REFRESH_STEP) return;
 
 		busy = true;
 		lastGenPct = pct; // optimistic: debounce immediately, regenerate at +REFRESH_STEP
+		const usageStr = fmtUsage(usage, threshold);
 		void (async () => {
 			try {
-				const path = await generateHandoff(ctx, `auto: context ${fmtPct(pct)}`);
+				const path = await generateHandoff(ctx, `auto: context ${usageStr}`);
 				if (path) {
 					ctx.ui.notify(
-						`[handoff] Context at ${fmtPct(pct)} — saved handoff to ${path}. ` +
+						`[handoff] Context at ${usageStr} — saved handoff to ${path}. ` +
 							"Consider /compact or a new session (it'll offer to reload this).",
 						"warning",
 					);
@@ -585,7 +714,8 @@ export default function (pi: ExtensionAPI) {
 			if (!ctx.hasUI) {
 				ctx.ui.notify(
 					"[handoff] No UI here — configure via env: " +
-						"PI_HANDOFF_MODEL=provider/id, PI_HANDOFF_THRESHOLD=80.",
+						"PI_HANDOFF_MODEL=provider/id, " +
+						"PI_HANDOFF_THRESHOLD=80% (or 120k).",
 					"warning",
 				);
 				return;
@@ -631,20 +761,97 @@ export default function (pi: ExtensionAPI) {
 				model = chosen ? `${chosen.provider}/${chosen.id}` : undefined;
 			}
 
-			// Step 2 — trigger threshold.
-			const current = cfg.threshold ?? DEFAULT_THRESHOLD;
-			let threshold = cfg.threshold;
-			const entered = await ctx.ui.input(
-				`Trigger at what % of context? (1–99, blank = ${current})`,
-				String(current),
-			);
-			if (entered && entered.trim()) {
-				const n = Number(entered.trim());
-				if (isValidThreshold(n)) {
-					threshold = n;
+			// Step 2 — trigger threshold (mode + value).
+			const currentThreshold: Threshold = normalizeStoredThreshold(
+				cfg.threshold,
+			) ?? { type: "percent", value: DEFAULT_THRESHOLD_PCT };
+
+			const PERCENT_LABEL = `Percentage of context window  (current: ${
+				currentThreshold.type === "percent"
+					? `${currentThreshold.value}%`
+					: `${DEFAULT_THRESHOLD_PCT}%`
+			})`;
+			const TOKENS_LABEL = `Absolute token count${
+				currentThreshold.type === "tokens"
+					? `  (current: ${formatTokens(currentThreshold.value)})`
+					: ""
+			}`;
+			const mode = await ctx.ui.select("Trigger mode", [
+				PERCENT_LABEL,
+				TOKENS_LABEL,
+			]);
+			if (mode === undefined) {
+				ctx.ui.notify("[handoff] Setup cancelled.", "info");
+				return;
+			}
+
+			let threshold: Threshold = currentThreshold;
+			if (mode === PERCENT_LABEL) {
+				const dflt =
+					currentThreshold.type === "percent"
+						? currentThreshold.value
+						: DEFAULT_THRESHOLD_PCT;
+				const entered = await ctx.ui.input(
+					`Trigger at what % of context? (1–99, blank = ${dflt})`,
+					String(dflt),
+				);
+				if (entered && entered.trim()) {
+					const n = Number(entered.trim());
+					if (isValidPercent(n)) {
+						threshold = { type: "percent", value: n };
+					} else {
+						ctx.ui.notify(
+							`[handoff] "${entered.trim()}" isn't 1–99; keeping ${dflt}%.`,
+							"warning",
+						);
+						threshold = { type: "percent", value: dflt };
+					}
+				} else {
+					threshold = { type: "percent", value: dflt };
+				}
+			} else {
+				// Tokens. Default to current value if user is already in token mode;
+				// otherwise suggest 80% of the active model's context window when known.
+				const window = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+				const suggested =
+					currentThreshold.type === "tokens"
+						? currentThreshold.value
+						: window
+							? Math.round((window * DEFAULT_THRESHOLD_PCT) / 100)
+							: undefined;
+				const dfltStr = suggested != null ? formatTokens(suggested) : "";
+				const hint = suggested != null
+					? `e.g. 120000 or 120k, blank = ${dfltStr}`
+					: `e.g. 120000 or 120k`;
+				const entered = await ctx.ui.input(
+					`Trigger at how many tokens? (${hint})`,
+					dfltStr,
+				);
+				const trimmed = entered?.trim();
+				if (trimmed) {
+					const n = parseTokenCount(trimmed);
+					if (n != null && isValidTokenCount(n)) {
+						threshold = { type: "tokens", value: n };
+					} else {
+						if (suggested != null) {
+							ctx.ui.notify(
+								`[handoff] "${trimmed}" isn't a valid token count; keeping ${formatTokens(suggested)}.`,
+								"warning",
+							);
+							threshold = { type: "tokens", value: suggested };
+						} else {
+							ctx.ui.notify(
+								`[handoff] "${trimmed}" isn't a valid token count; keeping previous setting.`,
+								"warning",
+							);
+						}
+					}
+				} else if (suggested != null) {
+					threshold = { type: "tokens", value: suggested };
 				} else {
 					ctx.ui.notify(
-						`[handoff] "${entered.trim()}" isn't 1–99; keeping ${current}%.`,
+						"[handoff] No token value entered and no model context window known; " +
+							"keeping previous threshold.",
 						"warning",
 					);
 				}
@@ -662,7 +869,7 @@ export default function (pi: ExtensionAPI) {
 			saveConfig({ ...cfg, model, threshold, compaction });
 			ctx.ui.notify(
 				`[handoff] Saved to ${configPath()} — model: ${model ?? "auto"}, ` +
-					`threshold: ${threshold ?? DEFAULT_THRESHOLD}%, ` +
+					`threshold: ${formatThreshold(threshold)}, ` +
 					`compaction: ${compaction}.`,
 				"info",
 			);

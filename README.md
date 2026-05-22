@@ -2,10 +2,11 @@
 
 Proactive context-handoff for the [pi](https://github.com/earendil-works) coding agent.
 
-When a session's context usage crosses a threshold (default **80%**), pi-handoff
-automatically writes a structured **handoff document** of the session so you can
-cleanly continue after a `/compact` or in a brand-new session — instead of
-losing the thread (or hitting the auto-compaction-mid-loop crash).
+When a session's context usage crosses a threshold (default **80%**, or any
+absolute token count you pick), pi-handoff automatically writes a structured
+**handoff document** of the session so you can cleanly continue after a
+`/compact` or in a brand-new session — instead of losing the thread (or hitting
+the auto-compaction-mid-loop crash).
 
 ## What it does
 
@@ -41,9 +42,9 @@ pi --extension /path/to/pi-handoff/index.ts
 ## Commands
 
 - `/handoff-setup` — guided setup (like `/login`): pick the **summarizer model**
-  (listed cheapest-first with per-Mtok cost), the **trigger threshold**, and
-  whether to **enrich `/compact`**. Saved to a config file so it sticks across
-  sessions.
+  (listed cheapest-first with per-Mtok cost), the **trigger mode** (percent of
+  context window or absolute token count) and value, and whether to **enrich
+  `/compact`**. Saved to a config file so it sticks across sessions.
 - `/handoff` — generate the handoff document right now.
 - `/handoff-load` — inject the existing `.pi/handoff.md` into this session.
 
@@ -53,22 +54,39 @@ The easy path is **`/handoff-setup`**. It writes your choices to a config file
 (default `~/.pi/agent/pi-handoff-config.json`):
 
 ```json
-{ "model": "sap-aicore/anthropic--claude-4.5-haiku", "threshold": 80, "compaction": "enrich" }
+{
+  "model": "sap-aicore/anthropic--claude-4.5-haiku",
+  "threshold": { "type": "percent", "value": 80 },
+  "compaction": "enrich"
+}
 ```
+
+Or, with an absolute token threshold:
+
+```json
+{
+  "model": "sap-aicore/anthropic--claude-4.5-haiku",
+  "threshold": { "type": "tokens", "value": 120000 },
+  "compaction": "enrich"
+}
+```
+
+> Older configs that stored a bare number (e.g. `"threshold": 80`) are still
+> read — they're treated as a percent threshold.
 
 Environment variables override the saved config (handy for one-off/scripted runs):
 
 | Var | Default | Meaning |
 |---|---|---|
 | `PI_HANDOFF_MODEL` | auto | Summarizer model as `provider/id` (e.g. `sap-aicore/anthropic--claude-4.5-haiku`). |
-| `PI_HANDOFF_THRESHOLD` | `80` | Context-usage percent that triggers handoff generation. |
+| `PI_HANDOFF_THRESHOLD` | `80%` | Trigger threshold. Accepts `80%` (percent), `120000` (tokens), `120k` / `1.5M` (suffix tokens). A bare integer 1–99 is treated as percent for back-compat with older setups. |
 | `PI_HANDOFF_COMPACTION` | `enrich` | `off` to disable enriching pi's `/compact` summary. |
 | `PI_HANDOFF_PATH` | `.pi/handoff.md` | Where to write the doc (relative to cwd, or absolute). |
 | `PI_HANDOFF_CONFIG` | `~/.pi/agent/pi-handoff-config.json` | Path to the saved config file. |
 
 **Model precedence:** `PI_HANDOFF_MODEL` → `/handoff-setup` choice → cheapest
 known model on your current provider → the active conversation model.
-**Threshold precedence:** `PI_HANDOFF_THRESHOLD` → `/handoff-setup` choice → `80`.
+**Threshold precedence:** `PI_HANDOFF_THRESHOLD` → `/handoff-setup` choice → `80%`.
 **Compaction precedence:** `PI_HANDOFF_COMPACTION` → `/handoff-setup` choice → on.
 
 ## Notes / limitations
