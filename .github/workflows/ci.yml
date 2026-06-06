@@ -1,0 +1,30 @@
+name: CI
+
+# Verify gate: typecheck every push to main and every PR. There is no build
+# step — pi loads the .ts sources directly via jiti — so "verify" is
+# `tsc --noEmit`, the same guard that runs locally before `npm publish`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck

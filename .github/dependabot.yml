@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # npm dependencies: concrete @earendil-works/* versions live in devDependencies
+  # while peer dependencies stay as "*" for Pi package compatibility.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      pi:
+        patterns:
+          - "@earendil-works/*"
+
+  # Keep workflow actions (checkout, setup-node, ...) current so they don't drift
+  # onto deprecated runtimes.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci(deps)"

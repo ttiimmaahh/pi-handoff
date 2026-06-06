@@ -1,0 +1,101 @@
+name: Publish
+
+# Tag-driven release. Bump the version locally with `npm version <patch|minor|major>`
+# (which commits package.json + tags vX.Y.Z), then `git push --follow-tags`.
+# This workflow fires on the v* tag, verifies the tag matches package.json,
+# typechecks, publishes to npm, and creates a matching GitHub Release.
+#
+# Auth is npm Trusted Publishing via OIDC — NO token. The package must have this
+# repo + workflow registered as a Trusted Publisher on npmjs.com (one-time setup;
+# see README "Releasing"). npm detects the OIDC environment automatically and
+# emits provenance attestations by default (no --provenance flag needed).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create the matching GitHub Release
+  id-token: write # required for OIDC trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing requires npm CLI >= 11.5.1.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Fail loud if the tag and package.json disagree, so we never publish a
+      # version that doesn't match the ref it was cut from. Reads the tag from
+      # the GITHUB_REF_NAME env var (not ${{ }} interpolation) — no injection.
+      - name: Verify tag matches package.json version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(node -p "require('./package.json').version")"
+          echo "tag=${tag_version} package.json=${pkg_version}"
+          if [ "${tag_version}" != "${pkg_version}" ]; then
+            echo "::error::Tag v${tag_version} does not match package.json version ${pkg_version}"
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Check npm publication status
+        id: npm_status
+        run: |
+          package_name="$(node -p "require('./package.json').name")"
+          package_version="$(node -p "require('./package.json').version")"
+          if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+            echo "${package_name}@${package_version} is already published; skipping npm publish."
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Publish to npm
+        if: steps.npm_status.outputs.published != 'true'
+        run: npm publish --access public
+
+      - name: Prepare GitHub Release notes
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          awk -v version="${tag_version}" '
+            $0 ~ "^## \\[" version "\\]" { in_section = 1; next }
+            in_section && $0 ~ "^## \\[" { exit }
+            in_section && $0 ~ "^\\[.*\\]:" { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "See CHANGELOG.md for release details." > release-notes.md
+          fi
+
+          printf "\n---\n\nPublished to npm: https://www.npmjs.com/package/@ttiimmaahh/pi-handoff/v/%s\n" "${tag_version}" >> release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi

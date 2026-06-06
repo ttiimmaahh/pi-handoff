@@ -10,12 +10,9 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-
-// The message type pi passes through the `context` hook. Derived from the
-// exported event type so we don't depend on @earendil-works/pi-agent-core directly.
-type AgentMessage = ContextEvent["messages"][number];
 import {
 	appendFileSync,
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	readFileSync,
@@ -25,15 +22,19 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
+// The message type pi passes through the `context` hook. Derived from the
+// exported event type so we don't depend on @earendil-works/pi-agent-core directly.
+type AgentMessage = ContextEvent["messages"][number];
+
 // ---------------------------------------------------------------------------
 // Config (env-overridable; sensible defaults so it works with zero setup)
 // ---------------------------------------------------------------------------
 
 const DEFAULT_THRESHOLD_PCT = 80; // percent of the context window
 // Once over threshold we don't regenerate every single turn — only after the
-// usage climbs another REFRESH_STEP percent, so the doc stays fresh without
-// firing a summarization call on each turn. We always debounce in percent,
-// regardless of which unit the threshold uses, so the cadence feels identical.
+// usage climbs another REFRESH_STEP in the configured unit. For percent
+// thresholds this is percentage points; for token thresholds this is 5% of the
+// active context window (falling back to 5% of the configured token threshold).
 const REFRESH_STEP = 5;
 const DEFAULT_REL_PATH = ".pi/handoff.md";
 // Only offer to reload a handoff this fresh on session start.
@@ -43,7 +44,7 @@ const CHEAP_HINTS = ["flash-lite", "flash", "haiku", "nano", "mini"];
 
 // Threshold can be a percent of the context window or an absolute token count.
 // Stored as a discriminated union; older configs (`threshold: 80`) are read as
-// percent for back-compat, see `readThreshold`.
+// percent for back-compat, see `normalizeStoredThreshold`.
 type Threshold =
 	| { type: "percent"; value: number }
 	| { type: "tokens"; value: number };
@@ -69,7 +70,9 @@ let cachedConfig: HandoffConfig | undefined;
 function getConfig(): HandoffConfig {
 	if (cachedConfig) return cachedConfig;
 	try {
-		cachedConfig = JSON.parse(readFileSync(configPath(), "utf8")) as HandoffConfig;
+		cachedConfig = JSON.parse(
+			readFileSync(configPath(), "utf8"),
+		) as HandoffConfig;
 	} catch {
 		cachedConfig = {};
 	}
@@ -90,7 +93,9 @@ function isValidPercent(n: number): boolean {
 function isValidTokenCount(n: number): boolean {
 	// Sane lower bound to catch typos like "100" meant as 100k; upper bound
 	// generous enough for any realistic context window.
-	return Number.isFinite(n) && Number.isInteger(n) && n >= 1000 && n <= 10_000_000;
+	return (
+		Number.isFinite(n) && Number.isInteger(n) && n >= 1000 && n <= 10_000_000
+	);
 }
 
 // Parse human-friendly token strings: "120000", "120k", "120K", "1.5m", "2M".
@@ -145,7 +150,9 @@ function normalizeStoredThreshold(
 }
 
 function formatThreshold(t: Threshold): string {
-	return t.type === "percent" ? `${t.value}%` : `${formatTokens(t.value)} tokens`;
+	return t.type === "percent"
+		? `${t.value}%`
+		: `${formatTokens(t.value)} tokens`;
 }
 
 // Compact token formatter for human-facing strings ("120k", "1.5M").
@@ -157,6 +164,38 @@ function formatTokens(n: number): string {
 	}
 	const m = n / 1_000_000;
 	return `${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}M`;
+}
+
+type FileOps = {
+	read: Set<string>;
+	written: Set<string>;
+	edited: Set<string>;
+};
+
+function computeFileLists(fileOps: FileOps): {
+	readFiles: string[];
+	modifiedFiles: string[];
+} {
+	const modified = new Set([...fileOps.edited, ...fileOps.written]);
+	const readFiles = [...fileOps.read].filter((f) => !modified.has(f)).sort();
+	const modifiedFiles = [...modified].sort();
+	return { readFiles, modifiedFiles };
+}
+
+function formatFileOperations(
+	readFiles: string[],
+	modifiedFiles: string[],
+): string {
+	const sections: string[] = [];
+	if (readFiles.length > 0) {
+		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
+	}
+	if (modifiedFiles.length > 0) {
+		sections.push(
+			`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`,
+		);
+	}
+	return sections.length > 0 ? `\n\n${sections.join("\n\n")}` : "";
 }
 
 // Durable diagnostics: set PI_HANDOFF_DEBUG to a file path (or "1" for
@@ -176,6 +215,32 @@ function debugLog(entry: Record<string, unknown>): void {
 		);
 	} catch {
 		// never let logging break a real operation
+	}
+}
+
+function readHandoffFile(path: string): string | undefined {
+	try {
+		return readFileSync(path, "utf8");
+	} catch (err) {
+		debugLog({
+			kind: "handoff-read-failed",
+			path,
+			error: (err as Error).message,
+		});
+		return undefined;
+	}
+}
+
+function isFreshHandoffFile(path: string): boolean {
+	try {
+		return Date.now() - statSync(path).mtimeMs <= STALE_MS;
+	} catch (err) {
+		debugLog({
+			kind: "handoff-stat-failed",
+			path,
+			error: (err as Error).message,
+		});
+		return false;
 	}
 }
 
@@ -274,7 +339,9 @@ function autoPickCheapModel(ctx: ExtensionContext): Model<Api> | undefined {
 			(a, b) =>
 				a.rank - b.rank ||
 				Number(b.m.provider === curProvider) -
-					Number(a.m.provider === curProvider),
+					Number(a.m.provider === curProvider) ||
+				compareModelCost(a.m, b.m) ||
+				`${a.m.provider}/${a.m.id}`.localeCompare(`${b.m.provider}/${b.m.id}`),
 		);
 	return ranked[0]?.m;
 }
@@ -293,9 +360,27 @@ function pickSummaryModel(ctx: ExtensionContext): Model<Api> | undefined {
 // Human-friendly model line for the setup picker. The name is padded to a
 // shared width so the cost column lines up vertically — that's what makes the
 // cheapest-first ordering obvious at a glance.
+function hasKnownCost(m: Model<Api>): boolean {
+	return (
+		typeof m.cost?.input === "number" && typeof m.cost?.output === "number"
+	);
+}
+
+function compareModelCost(a: Model<Api>, b: Model<Api>): number {
+	const aKnown = hasKnownCost(a);
+	const bKnown = hasKnownCost(b);
+	if (aKnown !== bKnown) return aKnown ? -1 : 1;
+	return (
+		(a.cost?.input ?? Number.POSITIVE_INFINITY) -
+			(b.cost?.input ?? Number.POSITIVE_INFINITY) ||
+		(a.cost?.output ?? Number.POSITIVE_INFINITY) -
+			(b.cost?.output ?? Number.POSITIVE_INFINITY)
+	);
+}
+
 function modelLabel(m: Model<Api>, nameWidth: number): string {
 	const name = `${m.provider}/${m.id}`;
-	const cost = m.cost
+	const cost = hasKnownCost(m)
 		? `$${m.cost.input}/$${m.cost.output} per Mtok`
 		: "cost n/a";
 	return `${name.padEnd(nameWidth)}  ${cost}`;
@@ -363,7 +448,10 @@ async function generateHandoff(
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 	if (!auth.ok || !auth.apiKey) {
-		ctx.ui.notify(`[handoff] No usable auth for ${model.id}; skipped.`, "warning");
+		ctx.ui.notify(
+			`[handoff] No usable auth for ${model.id}; skipped.`,
+			"warning",
+		);
 		return undefined;
 	}
 
@@ -419,9 +507,20 @@ async function generateHandoff(
 		.filter(Boolean)
 		.join("\n");
 
+	if (signal?.aborted) return undefined;
+
 	const path = handoffPath(ctx.sessionManager.getCwd());
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${header}\n${summary}\n`);
+	writeFileSync(path, `${header}\n${summary}\n`, { mode: 0o600 });
+	try {
+		chmodSync(path, 0o600);
+	} catch (err) {
+		debugLog({
+			kind: "handoff-chmod-failed",
+			path,
+			error: (err as Error).message,
+		});
+	}
 	return path;
 }
 
@@ -434,7 +533,10 @@ function isUserMessage(m: AgentMessage): m is UserMsg {
 // Merge the handoff into the FIRST user message rather than prepending a
 // separate one — back-to-back user messages break strict-alternation backends
 // (Anthropic via Bedrock/SAP).
-function injectHandoff(messages: AgentMessage[], handoff: string): AgentMessage[] {
+function injectHandoff(
+	messages: AgentMessage[],
+	handoff: string,
+): AgentMessage[] {
 	const banner =
 		"[Resuming from a previous session. The handoff document below is your " +
 		`context for continuing the work.]\n\n${handoff}\n\n---\n\n`;
@@ -459,11 +561,55 @@ function injectHandoff(messages: AgentMessage[], handoff: string): AgentMessage[
 }
 
 export default function (pi: ExtensionAPI) {
-	// Highest context percent we've already written a handoff for, so we debounce
-	// regeneration. Reset whenever the context shrinks (compaction / new session).
+	// Highest context usage we've successfully written a handoff for, so we
+	// debounce regeneration. Reset whenever the context shrinks (compaction / new session).
 	let lastGenPct: number | null = null;
+	let lastGenTokens: number | null = null;
 	let busy = false;
+	let autoGeneration: AbortController | undefined;
+	let generationId = 0;
 	let pendingInjection: string | undefined;
+
+	function resetDebounce(): void {
+		lastGenPct = null;
+		lastGenTokens = null;
+	}
+
+	function shouldDebounce(
+		usage: {
+			percent: number | null;
+			tokens: number | null;
+			contextWindow: number;
+		},
+		threshold: Threshold,
+	): boolean {
+		if (threshold.type === "percent") {
+			return (
+				usage.percent == null ||
+				(lastGenPct != null && usage.percent < lastGenPct + REFRESH_STEP)
+			);
+		}
+
+		if (usage.tokens == null) return true;
+		const tokenStep = Math.max(
+			1,
+			Math.round(
+				((usage.contextWindow || threshold.value) * REFRESH_STEP) / 100,
+			),
+		);
+		return lastGenTokens != null && usage.tokens < lastGenTokens + tokenStep;
+	}
+
+	function markGenerated(
+		usage: { percent: number | null; tokens: number | null },
+		threshold: Threshold,
+	): void {
+		if (threshold.type === "percent") {
+			lastGenPct = usage.percent;
+		} else {
+			lastGenTokens = usage.tokens;
+		}
+	}
 
 	// --- Threshold watcher: fire-and-forget so we never block the turn. -------
 	pi.on("turn_end", (_event, ctx) => {
@@ -471,20 +617,27 @@ export default function (pi: ExtensionAPI) {
 		if (!usage) return;
 		const threshold = effectiveThreshold();
 		if (!isOverThreshold(usage, threshold)) return;
-		// Debounce always tracks percent (regardless of threshold unit) so the
-		// regeneration cadence feels identical in both modes.
-		const pct = usage.percent;
-		if (pct == null) return;
-		if (busy) return;
-		if (lastGenPct != null && pct < lastGenPct + REFRESH_STEP) return;
+		if (busy || shouldDebounce(usage, threshold)) return;
 
 		busy = true;
-		lastGenPct = pct; // optimistic: debounce immediately, regenerate at +REFRESH_STEP
+		autoGeneration?.abort();
+		const controller = new AbortController();
+		autoGeneration = controller;
+		const thisGeneration = ++generationId;
 		const usageStr = fmtUsage(usage, threshold);
 		void (async () => {
 			try {
-				const path = await generateHandoff(ctx, `auto: context ${usageStr}`);
-				if (path) {
+				const path = await generateHandoff(
+					ctx,
+					`auto: context ${usageStr}`,
+					controller.signal,
+				);
+				if (
+					path &&
+					!controller.signal.aborted &&
+					thisGeneration === generationId
+				) {
+					markGenerated(usage, threshold);
 					ctx.ui.notify(
 						`[handoff] Context at ${usageStr} — saved handoff to ${path}. ` +
 							"Consider /compact or a new session (it'll offer to reload this).",
@@ -492,14 +645,17 @@ export default function (pi: ExtensionAPI) {
 					);
 				}
 			} catch (err) {
-				if (!signalAborted(ctx)) {
+				if (!controller.signal.aborted && !signalAborted(ctx)) {
 					ctx.ui.notify(
 						`[handoff] Generation failed: ${(err as Error).message}`,
 						"warning",
 					);
 				}
 			} finally {
-				busy = false;
+				if (autoGeneration === controller) {
+					autoGeneration = undefined;
+					busy = false;
+				}
 			}
 		})();
 	});
@@ -518,7 +674,10 @@ export default function (pi: ExtensionAPI) {
 		const model = pickSummaryModel(ctx);
 		if (!model) {
 			debugLog({ kind: "compaction-fallback", reason: "no-model" });
-			ctx.ui.notify("[handoff] No model for compaction; using pi default.", "warning");
+			ctx.ui.notify(
+				"[handoff] No model for compaction; using pi default.",
+				"warning",
+			);
 			return;
 		}
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -566,6 +725,9 @@ export default function (pi: ExtensionAPI) {
 		const prior = preparation.previousSummary
 			? `\n\nEarlier summary, for continuity:\n${preparation.previousSummary}`
 			: "";
+		const customInstructions = event.customInstructions?.trim()
+			? `\n\nAdditional user instructions for this compaction:\n${event.customInstructions.trim()}`
+			: "";
 
 		try {
 			const response = await complete(
@@ -577,7 +739,7 @@ export default function (pi: ExtensionAPI) {
 							content: [
 								{
 									type: "text" as const,
-									text: `${COMPACTION_PROMPT}${prior}\n\n<conversation>\n${conversation}\n</conversation>`,
+									text: `${COMPACTION_PROMPT}${prior}${customInstructions}\n\n<conversation>\n${conversation}\n</conversation>`,
 								},
 							],
 							timestamp: Date.now(),
@@ -605,16 +767,20 @@ export default function (pi: ExtensionAPI) {
 				return; // fall back to pi's default compaction
 			}
 
-			debugLog({ kind: "compaction-applied", model: model.id });
-			ctx.ui.notify(
-				`[handoff] Structured compaction via ${model.id}.`,
-				"info",
+			const { readFiles, modifiedFiles } = computeFileLists(
+				preparation.fileOps,
 			);
+			const summaryWithFiles =
+				summary + formatFileOperations(readFiles, modifiedFiles);
+
+			debugLog({ kind: "compaction-applied", model: model.id });
+			ctx.ui.notify(`[handoff] Structured compaction via ${model.id}.`, "info");
 			return {
 				compaction: {
-					summary,
+					summary: summaryWithFiles,
 					firstKeptEntryId: preparation.firstKeptEntryId,
 					tokensBefore: preparation.tokensBefore,
+					details: { readFiles, modifiedFiles },
 				},
 			};
 		} catch (err) {
@@ -634,12 +800,19 @@ export default function (pi: ExtensionAPI) {
 
 	// Context shrinks after compaction — allow the next threshold crossing to regenerate.
 	pi.on("session_compact", () => {
-		lastGenPct = null;
+		resetDebounce();
+	});
+
+	pi.on("session_shutdown", () => {
+		generationId++;
+		autoGeneration?.abort();
+		autoGeneration = undefined;
+		busy = false;
 	});
 
 	// --- New/resumed session: offer to reload a recent handoff. ---------------
 	pi.on("session_start", async (event, ctx) => {
-		lastGenPct = null;
+		resetDebounce();
 		// Offer reload on a genuinely fresh session (`new`) or on a fresh launch
 		// (`startup` — the crash-recovery case). Skip `resume`/`reload`/`fork`:
 		// those restore the full history, so a handoff would be redundant.
@@ -648,9 +821,10 @@ export default function (pi: ExtensionAPI) {
 
 		const path = handoffPath(ctx.sessionManager.getCwd());
 		if (!existsSync(path)) return;
-		if (Date.now() - statSync(path).mtimeMs > STALE_MS) return;
+		if (!isFreshHandoffFile(path)) return;
 
-		const content = readFileSync(path, "utf8");
+		const content = readHandoffFile(path);
+		if (!content) return;
 		// Never offer to reload a handoff that THIS session wrote (e.g. it auto-
 		// generated at the threshold, or pi resumed the same session on startup).
 		const wroteBy = content.match(/^- Session: (.+)$/m)?.[1]?.trim();
@@ -662,7 +836,10 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (load) {
 			pendingInjection = content;
-			ctx.ui.notify("[handoff] Loaded — injected on your next message.", "info");
+			ctx.ui.notify(
+				"[handoff] Loaded — injected on your next message.",
+				"info",
+			);
 		}
 	});
 
@@ -682,7 +859,8 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const path = await generateHandoff(ctx, "manual /handoff", ctx.signal);
 				if (path) {
-					lastGenPct = ctx.getContextUsage()?.percent ?? lastGenPct;
+					const usage = ctx.getContextUsage();
+					if (usage) markGenerated(usage, effectiveThreshold());
 					ctx.ui.notify(`[handoff] Saved to ${path}`, "info");
 				} else {
 					ctx.ui.notify("[handoff] Nothing to summarize yet.", "warning");
@@ -701,8 +879,19 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`[handoff] No handoff doc at ${path}.`, "warning");
 				return;
 			}
-			pendingInjection = readFileSync(path, "utf8");
-			ctx.ui.notify("[handoff] Loaded — injected on your next message.", "info");
+			const content = readHandoffFile(path);
+			if (!content) {
+				ctx.ui.notify(
+					`[handoff] Could not read handoff doc at ${path}.`,
+					"warning",
+				);
+				return;
+			}
+			pendingInjection = content;
+			ctx.ui.notify(
+				"[handoff] Loaded — injected on your next message.",
+				"info",
+			);
 		},
 	});
 
@@ -730,8 +919,7 @@ export default function (pi: ExtensionAPI) {
 				.slice()
 				.sort(
 					(a, b) =>
-						(a.cost?.input ?? 0) - (b.cost?.input ?? 0) ||
-						(a.cost?.output ?? 0) - (b.cost?.output ?? 0) ||
+						compareModelCost(a, b) ||
 						`${a.provider}/${a.id}`.localeCompare(`${b.provider}/${b.id}`),
 				);
 			if (models.length === 0) {
@@ -812,7 +1000,8 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				// Tokens. Default to current value if user is already in token mode;
 				// otherwise suggest 80% of the active model's context window when known.
-				const window = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
+				const window =
+					ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow;
 				const suggested =
 					currentThreshold.type === "tokens"
 						? currentThreshold.value
@@ -820,9 +1009,10 @@ export default function (pi: ExtensionAPI) {
 							? Math.round((window * DEFAULT_THRESHOLD_PCT) / 100)
 							: undefined;
 				const dfltStr = suggested != null ? formatTokens(suggested) : "";
-				const hint = suggested != null
-					? `e.g. 120000 or 120k, blank = ${dfltStr}`
-					: `e.g. 120000 or 120k`;
+				const hint =
+					suggested != null
+						? `e.g. 120000 or 120k, blank = ${dfltStr}`
+						: `e.g. 120000 or 120k`;
 				const entered = await ctx.ui.input(
 					`Trigger at how many tokens? (${hint})`,
 					dfltStr,
