@@ -24,6 +24,8 @@ brand-new session without losing the thread.
 
 ## Install
 
+Requires Pi **0.80.9–0.80.x** and Node.js **22.19.0 or newer**.
+
 ### From npm (recommended)
 
 ```bash
@@ -103,7 +105,7 @@ Or, with an absolute token threshold:
 Environment variables override the saved config (handy for one-off/scripted runs):
 
 | Var | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `PI_HANDOFF_MODEL` | auto | Summarizer model as `provider/id` (e.g. `sap-aicore/anthropic--claude-4.5-haiku`). |
 | `PI_HANDOFF_THRESHOLD` | `80%` | Trigger threshold. Accepts `80%` (percent), `120000` (tokens), `120k` / `1.5M` (suffix tokens). A bare integer 1–99 is treated as percent for back-compat with older setups. |
 | `PI_HANDOFF_COMPACTION` | `enrich` | `off` to disable enriching Pi's `/compact` summary. |
@@ -147,17 +149,19 @@ build step — Pi loads the `.ts` source directly via jiti — so a release is j
 1. Update `CHANGELOG.md`: move items from `[Unreleased]` into a new version
    heading.
 2. Bump the version (this commits `package.json` and creates a `vX.Y.Z` tag):
+
    ```bash
    npm version patch   # or minor / major
    git push --follow-tags
    ```
+
 3. The [`Publish`](.github/workflows/publish.yml) workflow fires on the `v*` tag,
-   asserts the tag matches `package.json`, typechecks, publishes to npm, and
-   creates/updates the matching GitHub Release from that version's
+   asserts the tag matches `package.json`, typechecks, tests, publishes to npm,
+   and creates/updates the matching GitHub Release from that version's
    `CHANGELOG.md` notes.
 
 Every push to `main` and every PR also runs the [`CI`](.github/workflows/ci.yml)
-typecheck gate.
+typecheck and regression-test gates.
 
 ### One-time setup: npm Trusted Publishing (OIDC)
 
@@ -184,7 +188,11 @@ npmjs.com:
 ├── CHANGELOG.md              # Keep a Changelog; updated per release
 ├── LICENSE                   # MIT
 ├── .github/workflows/
-│   ├── ci.yml                # typecheck gate on push to main + PRs
+│   ├── ci.yml                # typecheck + test gates on push to main + PRs
 │   └── publish.yml           # tag-driven npm publish via OIDC trusted publishing
+├── scripts/
+│   └── test-custom-provider-completion.mjs  # offline provider dispatch regression
+├── src/
+│   └── complete-summary.ts   # provider-aware nested summary completion
 └── index.ts                  # ExtensionAPI factory, commands, hooks, handoff logic
 ```

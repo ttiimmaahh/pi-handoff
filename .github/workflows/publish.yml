@@ -3,7 +3,7 @@ name: Publish
 # Tag-driven release. Bump the version locally with `npm version <patch|minor|major>`
 # (which commits package.json + tags vX.Y.Z), then `git push --follow-tags`.
 # This workflow fires on the v* tag, verifies the tag matches package.json,
-# typechecks, publishes to npm, and creates a matching GitHub Release.
+# typechecks, tests, publishes to npm, and creates a matching GitHub Release.
 #
 # Auth is npm Trusted Publishing via OIDC — NO token. The package must have this
 # repo + workflow registered as a Trusted Publisher on npmjs.com (one-time setup;
@@ -23,11 +23,14 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "24"
+          package-manager-cache: false
           registry-url: "https://registry.npmjs.org"
 
       # Trusted publishing requires npm CLI >= 11.5.1.
@@ -52,6 +55,9 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Test
+        run: npm test
 
       - name: Check npm publication status
         id: npm_status

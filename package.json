@@ -1,6 +1,6 @@
 {
   "name": "@ttiimmaahh/pi-handoff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Proactive context-handoff for the pi coding agent: at a context-usage threshold, auto-write a structured session handoff doc and offer to reload it in a new session.",
   "license": "MIT",
   "author": "Tim Pearson (https://github.com/ttiimmaahh)",
@@ -24,6 +24,8 @@
   ],
   "files": [
     "index.ts",
+    "src",
+    "scripts",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -35,20 +37,21 @@
     ]
   },
   "scripts": {
+    "test": "node scripts/test-custom-provider-completion.mjs",
     "typecheck": "tsc --noEmit",
     "pack:dry-run": "npm pack --dry-run",
-    "prepublishOnly": "npm run typecheck"
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": ">=0.80.9 <0.81",
+    "@earendil-works/pi-coding-agent": ">=0.80.9 <0.81"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.78.0",
-    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
     "typescript": "^6.0.3"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   }
 }

@@ -1,4 +1,3 @@
-import { complete } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	buildSessionContext,
@@ -19,6 +18,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { completeSummary } from "./src/complete-summary.ts";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -459,9 +459,10 @@ async function generateHandoff(
 	const conversation = serializeConversation(convertToLlm(messages));
 	if (!conversation.trim()) return undefined;
 
-	const response = await complete(
+	const response = await completeSummary({
+		ctx,
 		model,
-		{
+		context: {
 			messages: [
 				{
 					role: "user" as const,
@@ -475,8 +476,9 @@ async function generateHandoff(
 				},
 			],
 		},
-		{ apiKey: auth.apiKey, headers: auth.headers, maxTokens: 8192, signal },
-	);
+		auth,
+		signal,
+	});
 
 	const summary = joinAssistantText(response.content);
 	if (!summary) return undefined;
@@ -730,9 +732,10 @@ export default function (pi: ExtensionAPI) {
 			: "";
 
 		try {
-			const response = await complete(
+			const response = await completeSummary({
+				ctx,
 				model,
-				{
+				context: {
 					messages: [
 						{
 							role: "user" as const,
@@ -746,13 +749,9 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 				},
-				{
-					apiKey: auth.apiKey,
-					headers: auth.headers,
-					maxTokens: 8192,
-					signal: event.signal,
-				},
-			);
+				auth,
+				signal: event.signal,
+			});
 			const summary = joinAssistantText(response.content);
 			debugLog({
 				kind: "compaction-result",
